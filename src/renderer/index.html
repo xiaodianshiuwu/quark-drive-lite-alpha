@@ -167,8 +167,8 @@
 
         <div class="setrow">
           <div class="setlabel">
-            <div class="setname">上传分片预读并发</div>
-            <div class="sethint">同时预读的分片数，范围 1–8；上传请求按服务端要求依次发送。</div>
+            <div class="setname">上传分片并发</div>
+            <div class="sethint">同时上传的分片数，默认 3，范围 1–8；设置为 1 可使用顺序上传。</div>
           </div>
           <div class="setcontrol">
             <input type="number" id="set-up-part" class="input input-num" min="1" max="8" step="1">
@@ -187,8 +187,22 @@
 
         <div class="setrow">
           <div class="setlabel">
-            <div class="setname">单文件下载并行连接数</div>
-            <div class="sethint">大文件多连接并行下载，决定大文件速度，范围 1–16。</div>
+            <div class="setname">下载策略</div>
+            <div class="sethint">自动按文件大小分配连接；顺序下载使用单连接；并行下载按连接上限运行。</div>
+          </div>
+          <div class="setcontrol">
+            <select id="set-down-strategy" class="input" aria-label="下载策略">
+              <option value="auto">自动</option>
+              <option value="sequential">顺序下载</option>
+              <option value="parallel">并行下载</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="setrow">
+          <div class="setlabel">
+            <div class="setname">单文件下载连接上限</div>
+            <div class="sethint">范围 1–16；自动策略下小文件会使用更少连接，新任务及恢复任务使用当前设置。</div>
           </div>
           <div class="setcontrol">
             <input type="number" id="set-down-parallel" class="input input-num" min="1" max="16" step="1">

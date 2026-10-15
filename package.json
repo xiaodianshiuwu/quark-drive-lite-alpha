@@ -9,9 +9,10 @@
   "scripts": {
     "start": "node scripts/tauri.js dev",
     "build": "node scripts/tauri.js build",
-    "check": "cargo check --workspace",
+    "check": "node scripts/rust.js check",
     "test": "node --test test/tauri*.test.js",
-    "test:rust": "cargo test --workspace",
+    "test:rust": "node scripts/rust.js test",
+    "verify:native": "node scripts/native-smoke.js",
     "test:legacy": "node --test test/*.test.js"
   },
   "devDependencies": {

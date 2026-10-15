@@ -4,7 +4,6 @@ use quark_core::{Core, Error, Result};
 use quark_transfer::TransferManager;
 use serde_json::{json, Value};
 use std::{
-    collections::HashSet,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -20,6 +19,7 @@ struct State {
     transfers: TransferManager,
     login: Arc<AtomicBool>,
     login_generation: Arc<AtomicU64>,
+    account_control: Arc<tokio::sync::Mutex<()>>,
     _profile_lock: Arc<std::fs::File>,
 }
 
@@ -54,6 +54,14 @@ async fn qk_call(
     if method == "auth.login" {
         return login(app, state.inner().clone()).await;
     }
+    if state.login.load(Ordering::SeqCst)
+        && matches!(
+            method.as_str(),
+            "transfer.upload" | "transfer.download" | "transfer.resume" | "transfer.retry"
+        )
+    {
+        return Err(Error::new("CONFLICT", "请完成或关闭登录窗口后再启动传输"));
+    }
     if method.starts_with("dialog.") {
         return dialog(&app, &method, params).await;
     }
@@ -72,8 +80,13 @@ async fn qk_call(
             .ok_or_else(|| Error::new("NOT_FOUND", "本地路径不存在"))?;
         return open_local(path, true).await;
     }
-    if method == "auth.logout" {
+    let _account_guard = if method == "auth.logout" {
         state.login_generation.fetch_add(1, Ordering::SeqCst);
+        Some(state.account_control.lock().await)
+    } else {
+        None
+    };
+    if method == "auth.logout" {
         if let Some(login) = app.get_webview_window("login") {
             let _ = login.close();
         }
@@ -122,6 +135,7 @@ async fn login(app: tauri::AppHandle, state: State) -> Result<Value> {
         }
     }
     let _reset = Reset(state.login.clone());
+    state.transfers.pause_all().await?;
     let generation = state.login_generation.fetch_add(1, Ordering::SeqCst) + 1;
     let window = tauri::WebviewWindowBuilder::new(
         &app,
@@ -148,25 +162,32 @@ async fn login(app: tauri::AppHandle, state: State) -> Result<Value> {
             let w=window.clone();
             // Cookie APIs may block on WebView2; never call them on the UI thread.
             let cookies=tauri::async_runtime::spawn_blocking(move ||w.cookies()).await.map_err(shell_error)?.map_err(shell_error)?;
-            let mut seen=HashSet::new();
             let items:Vec<Value>=cookies.iter().filter(|c|{
                 let d=c.domain().unwrap_or("").trim_start_matches('.');
-                (d=="quark.cn"||d.ends_with(".quark.cn"))&&seen.insert(c.name().to_owned())
+                d=="quark.cn"||d.ends_with(".quark.cn")
             }).map(|c|json!({"name":c.name(),"value":c.value(),"domain":c.domain(),"path":c.path().unwrap_or("/"),"httpOnly":c.http_only().unwrap_or(false),"secure":c.secure().unwrap_or(false),"expires":c.expires_datetime().map(|t|t.unix_timestamp())})).collect();
-            let header=items.iter().map(|c|format!("{}={}",c["name"].as_str().unwrap_or(""),c["value"].as_str().unwrap_or(""))).collect::<Vec<_>>().join("; ");
+            let header=Core::cookies_for_api(Value::Array(items.clone()))?;
             if header.is_empty()||header==last {continue;}
             let response=state.core.http_client().get("https://drive-pc.quark.cn/1/clouddrive/config?pr=ucpro&fr=pc")
+                .query(&[("uc_param_str",quark_core::UC_PARAMS),("device_model","pc")])
                 .header("cookie",header.clone()).header("referer","https://pan.quark.cn/").header("origin","https://pan.quark.cn")
                 .timeout(Duration::from_secs(20)).send().await;
             if let Ok(response)=response {
                 if response.status().as_u16()==401 {last=header.clone();}
                 if response.status().is_success() {
                 if let Ok(envelope)=response.json::<Value>().await {if envelope["code"]==0 {
+                    let _account_guard=state.account_control.lock().await;
                     if app.get_webview_window("login").is_none() || state.login_generation.load(Ordering::SeqCst)!=generation {return Err(Error::new("ABORTED","登录已取消"));}
                     state.core.replace_cookies(Value::Array(items))?;
-                    let auth=state.core.call("auth.verify",Value::Null).await?;
+                    state.core.call("auth.verify",Value::Null).await?;
+                    let _=state.core.call("auth.getUserInfo",Value::Null).await;
+                    let auth=state.core.call("auth.status",Value::Null).await?;
                     if state.login_generation.load(Ordering::SeqCst)!=generation {return Err(Error::new("ABORTED","登录已取消"));}
                     let _=app.emit_to("main","qk:auth-changed",&auth);
+                    #[cfg(debug_assertions)]
+                    if let Some(path)=std::env::var_os("QK_AUTH_REPORT") {
+                        let _=std::fs::write(path,serde_json::to_vec(&json!({"loggedIn":auth["loggedIn"],"identified":state.core.account_key().is_some()})).unwrap_or_default());
+                    }
                     return Ok(auth);
                 }}
             }}
@@ -324,6 +345,7 @@ fn main() {
                 transfers: transfers.clone(),
                 login: Arc::new(AtomicBool::new(false)),
                 login_generation: Arc::new(AtomicU64::new(0)),
+                account_control: Arc::new(tokio::sync::Mutex::new(())),
                 _profile_lock: Arc::new(profile_lock),
             };
             let main_window = app
@@ -331,7 +353,8 @@ fn main() {
                 .expect("main window configured");
             let close_handle = app.handle().clone();
             main_window.on_window_event(move |event| {
-                if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
                     close_handle.exit(0);
                 }
             });
@@ -383,7 +406,9 @@ fn main() {
                         let handle = app.clone();
                         let manager = app.state::<State>().transfers.clone();
                         tauri::async_runtime::spawn(async move {
-                            let _ = manager.pause_all().await;
+                            let _ =
+                                tokio::time::timeout(Duration::from_secs(8), manager.pause_all())
+                                    .await;
                             handle.exit(0);
                         });
                     }

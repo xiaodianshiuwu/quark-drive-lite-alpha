@@ -45,8 +45,9 @@
       downloadDir: '',
       uploadConcurrency: 2,
       downloadConcurrency: 2,
-      downloadParallel: 4,
-      uploadPartConcurrency: 2,
+      downloadParallel: 16,
+      downloadStrategy: 'auto',
+      uploadPartConcurrency: 3,
       theme: 'light',
     },
     transfers: [],
@@ -62,6 +63,7 @@
   var toastSeq = 0;
   var listSeq = 0;
   var listFrame = null;
+  var transferSeq = 0;
   var topSpacer = null;
   var bottomSpacer = null;
 
@@ -269,9 +271,8 @@
     if (!ok) return;
     try {
       await API.auth.logout();
-      state.account = { loggedIn: false, expired: false };
+      applyAccount({ loggedIn: false, expired: false });
       clearExpiredBanner();
-      renderAccount();
       toast('info', '已退出登录');
     } catch (err) {
       reportError(err, '退出登录失败');
@@ -284,10 +285,26 @@
 
   function applyAccount(s) {
     if (!s || typeof s !== 'object') return;
+    var previous = state.account;
     state.account = s;
+    if (previous && previous.loggedIn && (!s.loggedIn || s.expired ||
+        (previous.userId && s.userId && previous.userId !== s.userId))) {
+      // Invalidate in-flight pages as well as the rendered rows on account changes.
+      state.quota = null;
+      state.fid = ROOT_FID;
+      state.mode = 'browse';
+      state.keyword = '';
+      state.crumbs = [{ fid: ROOT_FID, name: '全部文件' }];
+      el.searchInput.value = '';
+      el.searchClear.hidden = true;
+      resetList();
+      renderCrumbs();
+      renderEmpty(s.expired ? '登录状态已失效，请重新登录' : '请先登录夸克网盘', false);
+    }
     if (s.expired === true) showExpiredBanner();
     else if (s.loggedIn === true) clearExpiredBanner();
     renderAccount();
+    renderSettings();
   }
 
   function renderAccount() {
@@ -361,8 +378,10 @@
   }
 
   async function refreshQuota() {
+    var account = state.account;
     try {
       var q = await API.auth.quota();
+      if (state.account !== account || !account || !account.loggedIn) return;
       if (q && typeof q.total === 'number') { state.quota = q; renderAccount(); }
     } catch (e) { /* 容量信息失败不打扰用户 */ }
   }
@@ -1497,8 +1516,10 @@
   }
 
   async function refreshTransfers() {
+    var seq = ++transferSeq;
     try {
       var list = await API.transfer.list();
+      if (seq !== transferSeq) return;
       state.transfers = Array.isArray(list) ? list : [];
       state.transfersLoaded = true;
       renderTransfers();
@@ -1521,7 +1542,8 @@
         if (API.has('transfer', 'openItem')) {
           try {
             var r = await API.transfer.openItem(id);
-            done = r !== null && r !== undefined && r !== false;
+            // Tauri commands commonly return JSON null after a successful shell action.
+            done = r !== false;
           } catch (e) { done = false; }
         }
         if (!done) {
@@ -1580,8 +1602,9 @@
           downloadDir: s.downloadDir || '',
           uploadConcurrency: Number(s.uploadConcurrency) || 2,
           downloadConcurrency: Number(s.downloadConcurrency) || 2,
-          downloadParallel: Number(s.downloadParallel) || 4,
-          uploadPartConcurrency: Number(s.uploadPartConcurrency) || 2,
+          downloadParallel: Number(s.downloadParallel) || 16,
+          downloadStrategy: ['auto', 'sequential', 'parallel'].indexOf(s.downloadStrategy) >= 0 ? s.downloadStrategy : 'auto',
+          uploadPartConcurrency: Number(s.uploadPartConcurrency) || 3,
           theme: s.theme === 'dark' ? 'dark' : 'light'
         };
         applyTheme(state.settings.theme);
@@ -1602,6 +1625,7 @@
     el.downConc.value = state.settings.downloadConcurrency;
     if (el.upPart) el.upPart.value = state.settings.uploadPartConcurrency;
     if (el.downParallel) el.downParallel.value = state.settings.downloadParallel;
+    if (el.downStrategy) el.downStrategy.value = state.settings.downloadStrategy;
     applyTheme(state.settings.theme);
     var a = state.account;
     el.setAccountHint.textContent = !API.injected
@@ -1888,7 +1912,7 @@
       saveSettings({ uploadConcurrency: v });
     });
     if (el.upPart) el.upPart.addEventListener('change', function () {
-      var v = clampInt(el.upPart.value, 1, 8, 2);
+      var v = clampInt(el.upPart.value, 1, 8, 3);
       el.upPart.value = v;
       saveSettings({ uploadPartConcurrency: v });
     });
@@ -1898,9 +1922,12 @@
       saveSettings({ downloadConcurrency: v });
     });
     if (el.downParallel) el.downParallel.addEventListener('change', function () {
-      var v = clampInt(el.downParallel.value, 1, 16, 4);
+      var v = clampInt(el.downParallel.value, 1, 16, 16);
       el.downParallel.value = v;
       saveSettings({ downloadParallel: v });
+    });
+    if (el.downStrategy) el.downStrategy.addEventListener('change', function () {
+      saveSettings({ downloadStrategy: el.downStrategy.value });
     });
     el.themeSeg.addEventListener('click', function (e) {
       var b = e.target.closest ? e.target.closest('.seg') : null;
@@ -2027,6 +2054,7 @@
     el.downConc = $('set-down-conc');
     el.upPart = $('set-up-part');
     el.downParallel = $('set-down-parallel');
+    el.downStrategy = $('set-down-strategy');
     el.themeSeg = $('set-theme');
     el.btnPickDir = $('btn-pick-dir');
     el.btnOpenDir = $('btn-open-dir');
@@ -2048,6 +2076,7 @@
 
     var onTasks = function (tasks) {
       if (!Array.isArray(tasks)) return;
+      transferSeq += 1;
       state.transfers = tasks;
       state.transfersLoaded = true;
       renderTransfers();
@@ -2065,7 +2094,13 @@
 
   async function boot() {
     cacheEls();
-    if (el.btnQuit) el.btnQuit.addEventListener('click', function () { if (window.qk && window.qk.app) window.qk.app.quit(); });
+    if (el.btnQuit) {
+      el.btnQuit.hidden = !API.has('app', 'quit');
+      el.btnQuit.addEventListener('click', async function () {
+        try { await API.app.quit(); }
+        catch (err) { reportError(err, '退出客户端失败'); }
+      });
+    }
     bindEvents();
     setupDragDrop();
     unsubs.push(API.dialog.onFilesDropped(function (paths) {

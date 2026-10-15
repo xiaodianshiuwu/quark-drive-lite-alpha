@@ -1,6 +1,7 @@
 use crate::manager::{err, Result};
 use unicode_normalization::UnicodeNormalization;
 pub const OSS_USER_AGENT: &str = "aliyun-sdk-js/6.6.1 Chrome 98.0.4758.80 on Windows 10 64-bit";
+#[cfg(test)]
 pub fn put_meta(
     mime: &str,
     date: &str,
@@ -9,7 +10,22 @@ pub fn put_meta(
     part: u64,
     upload_id: &str,
 ) -> String {
-    format!("PUT\n\n{mime}\n{date}\nx-oss-date:{date}\nx-oss-user-agent:{OSS_USER_AGENT}\n/{bucket}/{key}?partNumber={part}&uploadId={upload_id}")
+    put_meta_with_ctx(mime, date, bucket, key, part, upload_id, None)
+}
+pub fn put_meta_with_ctx(
+    mime: &str,
+    date: &str,
+    bucket: &str,
+    key: &str,
+    part: u64,
+    upload_id: &str,
+    hash_context: Option<&str>,
+) -> String {
+    // The observed protocol signs this header with exactly this capitalization.
+    let context = hash_context
+        .map(|s| format!("X-Oss-Hash-Ctx:{s}\n"))
+        .unwrap_or_default();
+    format!("PUT\n\n{mime}\n{date}\n{context}x-oss-date:{date}\nx-oss-user-agent:{OSS_USER_AGENT}\n/{bucket}/{key}?partNumber={part}&uploadId={upload_id}")
 }
 pub fn complete_meta(
     md5: &str,
@@ -41,17 +57,35 @@ pub fn oss_url(raw: &str, bucket: &str, key: &str) -> Result<reqwest::Url> {
         .ok_or_else(|| err("SERVER", "上传地址缺少主机"))?;
     if !["http", "https"].contains(&u.scheme())
         || bucket.is_empty()
-        || bucket.contains(['/', ':', '@'])
+        || bucket.len() > 253
+        || !bucket.split('.').all(|part| {
+            !part.is_empty()
+                && part.len() <= 63
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && !part.starts_with('-')
+                && !part.ends_with('-')
+        })
         || key.is_empty()
+        || key.split('/').any(|part| part == "." || part == "..")
         || u.port().is_some()
+        || !u.username().is_empty()
+        || u.password().is_some()
+        || u.query().is_some()
+        || u.fragment().is_some()
+        || u.path() != "/"
     {
         return Err(err("SERVER", "上传地址或存储桶无效"));
     }
-    reqwest::Url::parse(&format!(
-        "https://{bucket}.{host}/{}",
-        key.trim_start_matches('/')
-    ))
-    .map_err(|_| err("SERVER", "上传对象地址无效"))
+    let mut target = reqwest::Url::parse(&format!("https://{bucket}.{host}/"))
+        .map_err(|_| err("SERVER", "上传对象地址无效"))?;
+    target
+        .path_segments_mut()
+        .map_err(|_| err("SERVER", "上传对象路径无效"))?
+        .clear()
+        .extend(key.trim_start_matches('/').split('/'));
+    Ok(target)
 }
 pub fn safe_name(input: &str) -> String {
     let mut name: String = input
@@ -122,13 +156,29 @@ mod tests {
     #[test]
     fn signed_upload_origin_and_download_names_are_constrained() {
         assert!(oss_url("https://oss.example.net", "bucket", "obj").is_ok());
-        assert!(oss_url("https://oss.example.net", "bad.bucket", "obj").is_err());
-        assert!(oss_url("https://oss.example.net:443", "bucket", "obj").is_err());
-        assert_eq!(safe_name("../CON.txt"), "_.._CON.txt");
+        // A dotted DNS bucket is not an origin escape; URL normalizes :443.
+        assert!(oss_url("https://oss.example.net", "dns.bucket", "obj").is_ok());
+        assert!(oss_url("https://oss.example.net:443", "bucket", "obj").is_ok());
+        assert!(oss_url("https://oss.example.net:444", "bucket", "obj").is_err());
+        assert!(oss_url("https://oss.example.net", "bad/bucket", "obj").is_err());
+        assert!(oss_url("https://user:pass@oss.example.net", "bucket", "obj").is_err());
+        assert!(oss_url("https://oss.example.net/?token=x", "bucket", "obj").is_err());
+        assert_eq!(
+            oss_url("oss.example.net", "bucket", "a/b?#%.txt")
+                .unwrap()
+                .as_str(),
+            "https://bucket.oss.example.net/a/b%3F%23%25.txt"
+        );
+        assert_eq!(safe_name("../CON.txt"), ".._CON.txt");
+        assert_eq!(safe_name("CON.txt"), "_CON.txt");
         assert_eq!(
             content_range("bytes 0-1048575/5000000"),
             Some((0, 1048575, 5000000))
         );
         assert_eq!(content_range("bytes */5000000"), None);
+    }
+    #[test]
+    fn prefix_context_is_signed_in_the_observed_header_position() {
+        assert_eq!(put_meta_with_ctx("text/plain", "date", "b", "k", 2, "u", Some("Y3R4")), format!("PUT\n\ntext/plain\ndate\nX-Oss-Hash-Ctx:Y3R4\nx-oss-date:date\nx-oss-user-agent:{OSS_USER_AGENT}\n/b/k?partNumber=2&uploadId=u"));
     }
 }

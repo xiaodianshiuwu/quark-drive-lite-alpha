@@ -11,7 +11,7 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{Mutex as AsyncMutex, Notify};
+use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -74,6 +74,8 @@ pub(crate) struct Task {
     pub eta: i64,
     #[serde(default)]
     pub checkpoint: Value,
+    #[serde(default)]
+    pub account_key: Option<String>,
     #[serde(skip)]
     pub sample: Option<(u64, u64)>,
 }
@@ -93,6 +95,8 @@ pub(crate) struct Inner {
     disk: Mutex<()>,
     path: PathBuf,
     started: AtomicBool,
+    pub(crate) download_slots: Semaphore,
+    pub(crate) upload_buffers: Semaphore,
 }
 #[derive(Clone)]
 pub struct TransferManager {
@@ -158,6 +162,8 @@ impl TransferManager {
                 disk: Mutex::new(()),
                 path,
                 started: AtomicBool::new(false),
+                download_slots: Semaphore::new(32),
+                upload_buffers: Semaphore::new(64 * 1024),
             }),
         };
         result.persist()?;
@@ -225,8 +231,8 @@ impl TransferManager {
             |t| {
                 let ts = now();
                 if let Some((at, old)) = t.sample {
-                    if ts - at >= 250 {
-                        t.speed = bytes.saturating_sub(old) * 1000 / (ts - at).max(1);
+                    if ts.saturating_sub(at) >= 250 {
+                        t.speed = bytes.saturating_sub(old) * 1000 / ts.saturating_sub(at).max(1);
                         t.sample = Some((ts, bytes));
                     }
                 } else {
@@ -253,9 +259,16 @@ impl TransferManager {
     }
     fn pump(&self) {
         let settings = self.inner.core.settings();
+        let account = self.inner.core.account_key();
         let mut active = self.inner.active.lock().unwrap();
         let mut tasks = self.inner.tasks.lock().unwrap();
         for task in tasks.iter_mut().filter(|t| t.status == "pending") {
+            if account.is_none() || task.account_key != account {
+                task.status = "paused".into();
+                task.error_code = Some("ACCOUNT_MISMATCH".into());
+                task.error = Some("请登录创建此任务的账号后继续；旧版未绑定任务请重新创建".into());
+                continue;
+            }
             if active.contains_key(&task.id) {
                 continue;
             }
@@ -324,6 +337,19 @@ impl TransferManager {
             "transfer.list" => Ok(self.snapshot()),
             "transfer.upload" | "transfer.download" => {
                 let _control = self.inner.controls.lock().await;
+                if self.inner.core.account_key().is_none()
+                    && !self.inner.core.cookie_header().is_empty()
+                {
+                    self.inner
+                        .core
+                        .call("auth.getUserInfo", Value::Null)
+                        .await?;
+                }
+                let account_key = self
+                    .inner
+                    .core
+                    .account_key()
+                    .ok_or_else(|| err("NEED_LOGIN", "请先登录并验证账号，再创建传输任务"))?;
                 let upload = method == "transfer.upload";
                 let key = if upload { "localPaths" } else { "fids" };
                 let items = params[key]
@@ -384,6 +410,7 @@ impl TransferManager {
                         speed: 0,
                         eta: -1,
                         checkpoint: json!({}),
+                        account_key: Some(account_key.clone()),
                         sample: None,
                     });
                 }
@@ -424,6 +451,12 @@ impl TransferManager {
                 let _control = self.inner.controls.lock().await;
                 let id = param_id(&params)?;
                 let t = self.task(&id)?;
+                if t.account_key.is_none() || t.account_key != self.inner.core.account_key() {
+                    return Err(err(
+                        "ACCOUNT_MISMATCH",
+                        "请登录创建此任务的账号后继续；旧版未绑定任务请重新创建",
+                    ));
+                }
                 if t.status != "paused"
                     && t.status != "error"
                     && !(method == "transfer.retry" && t.status == "canceled")
@@ -452,6 +485,23 @@ impl TransferManager {
                     .as_array()
                     .or_else(|| params["ids"].as_array())
                     .ok_or_else(|| err("INVALID_ARG", "缺少任务列表"))?;
+                let cleanup: Vec<Task> = self
+                    .inner
+                    .tasks
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|t| {
+                        t.kind == "download"
+                            && ["error", "canceled"].contains(&t.status.as_str())
+                            && list.iter().any(|id| id.as_str() == Some(&t.id))
+                    })
+                    .cloned()
+                    .collect();
+                for t in &cleanup {
+                    self.wait_stop(&t.id).await;
+                    crate::download::cleanup(t).await?;
+                }
                 let active = self.inner.active.lock().unwrap();
                 self.inner.tasks.lock().unwrap().retain(|t| {
                     active.contains_key(&t.id)
@@ -508,4 +558,71 @@ fn param_id(params: &Value) -> Result<String> {
         .or_else(|| params["id"].as_str())
         .map(str::to_owned)
         .ok_or_else(|| err("INVALID_ARG", "缺少任务 id"))
+}
+
+#[cfg(test)]
+pub(crate) fn fixture(dir: &Path) -> (TransferManager, String) {
+    let core = Core::open(dir.join("profile")).unwrap();
+    // Synthetic local-only cookies must never be sent to the loopback download host.
+    core.replace_cookies(json!([{"name":"fixture","value":"synthetic","domain":"quark.cn"}]))
+        .unwrap();
+    let m = TransferManager::open(core).unwrap();
+    let id = Uuid::new_v4().to_string();
+    let task: Task = serde_json::from_value(json!({
+        "id":id,"kind":"download","name":"fixture.bin","size":0,"transferred":0,
+        "status":"paused","attempts":0,"createdAt":now(),"updatedAt":now(),
+        "localDir":dir.to_string_lossy(),"checkpoint":{}
+    }))
+    .unwrap();
+    m.inner.tasks.lock().unwrap().push(task);
+    m.persist().unwrap();
+    (m, id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn interrupted_tasks_recover_paused_and_cannot_cross_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, id) = fixture(dir.path());
+        m.update(
+            &id,
+            |t| {
+                t.status = "running".into();
+                t.account_key = Some("quark:old-account".into());
+                t.checkpoint = json!({"fixturePart":3});
+            },
+            true,
+        )
+        .unwrap();
+        let reopened = TransferManager::open(m.inner.core.clone()).unwrap();
+        assert_eq!(reopened.task(&id).unwrap().status, "paused");
+        assert_eq!(reopened.task(&id).unwrap().checkpoint["fixturePart"], 3);
+        assert!(reopened.snapshot()[0].get("checkpoint").is_none());
+        let e = reopened
+            .call("transfer.resume", json!({"id":id}))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, "ACCOUNT_MISMATCH");
+        reopened
+            .call("transfer.pause", json!({"id":id}))
+            .await
+            .unwrap();
+        assert_eq!(reopened.task(&id).unwrap().status, "paused");
+    }
+    #[tokio::test]
+    async fn missing_verified_account_cannot_enqueue_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = TransferManager::open(Core::open(dir.path()).unwrap()).unwrap();
+        let e = m
+            .call(
+                "transfer.download",
+                json!({"fids":["not-a-real-fid"],"localDir":dir.path()}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, "NEED_LOGIN");
+        assert_eq!(m.snapshot(), json!([]));
+    }
 }

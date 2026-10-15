@@ -27,9 +27,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": [
-      "app"
-    ],
+    "targets": "all",
     "category": "Utility",
     "shortDescription": "夸克网盘极简客户端，Tauri 2 与 Rust 核心",
     "macOS": {

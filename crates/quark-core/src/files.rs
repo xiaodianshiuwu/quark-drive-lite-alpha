@@ -18,7 +18,10 @@ fn truth(value: &Value) -> bool {
     match value {
         Value::Bool(b) => *b,
         Value::Number(n) => n.as_f64().is_some_and(|v| v != 0.0),
-        Value::String(s) => matches!(s.to_ascii_lowercase().as_str(), "true" | "yes" | "on" | "1"),
+        Value::String(s) => matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "true" | "yes" | "on" | "1"
+        ),
         _ => false,
     }
 }
@@ -84,8 +87,24 @@ fn accepted(env: &Value) -> Value {
         json!({"done":false,"taskId":id})
     }
 }
-fn task_entry(value: &Value) -> Value {
-    json!({"taskId":task_id(value),"status":value.get("status").unwrap_or(&json!(-1)),"done":truth(&value["finish"])||truth(&value["done"])||truth(&value["success"])||value["status"].as_str().is_some_and(|s|s.trim().eq_ignore_ascii_case("finish")),"raw":value})
+fn task_entry(value: &Value) -> Result<Value> {
+    let status = value["status"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let finished = truth(&value["finish"]) || truth(&value["done"]) || status == "finish";
+    // Finishing is not synonymous with succeeding. Explicit failure wins over
+    // completion flags, while undocumented numeric states remain unresolved.
+    if truth(&value["failed"])
+        || ["failed", "failure", "error", "cancelled", "canceled"].contains(&status.as_str())
+        || (finished && value["success"] == false)
+    {
+        return Err(Error::new("TASK_FAILED", "云端文件操作失败，请刷新后重试"));
+    }
+    Ok(
+        json!({"taskId":task_id(value),"status":value.get("status").unwrap_or(&json!(-1)),"done":finished||truth(&value["success"]),"raw":value}),
+    )
 }
 pub(crate) fn file_item(raw: &Value) -> Value {
     let original = raw["file_name"]
@@ -153,7 +172,7 @@ fn page_result(env: &Value, page: i64, size: i64) -> Value {
     json!({"list":entries,"total":total,"page":page,"size":size,"hasMore":has_more})
 }
 impl Core {
-    async fn file_page(&self, params: &Value, search: bool) -> Result<Value> {
+    async fn file_page(&self, generation: u64, params: &Value, search: bool) -> Result<Value> {
         let page = number(&params["page"], 1).max(1);
         let size = number(&params["size"], 50).clamp(1, 1000);
         let mut query = vec![
@@ -193,68 +212,76 @@ impl Core {
                 query.push(("cat", cat));
             }
         }
-        let env = self.get(path, &query).await?;
-        if search && list(&env).is_none() {
+        let env = self.get_in_session(generation, path, &query).await?;
+        if list(&env).is_none() {
             return Err(Error::new(
                 "SERVER",
-                "搜索响应缺少文件列表，暂时无法确认搜索结果",
+                if search {
+                    "搜索响应缺少文件列表，暂时无法确认搜索结果"
+                } else {
+                    "目录响应缺少文件列表，请刷新重试"
+                },
             ));
         }
         Ok(page_result(&env, page, size))
     }
-    async fn task_status(&self, params: &Value) -> Result<Value> {
+    async fn task_status(&self, generation: u64, params: &Value) -> Result<Value> {
         let env = self
-            .post(
+            .post_in_session(
+                generation,
                 "/1/clouddrive/task/status",
                 json!({"task_ids":ids(&params["taskIds"])? ,"op_type":number(&params["opType"],1)}),
             )
             .await?;
         if let Some(a) = list(&env) {
-            Ok(Value::Array(a.iter().map(task_entry).collect()))
+            Ok(Value::Array(
+                a.iter().map(task_entry).collect::<Result<Vec<_>>>()?,
+            ))
         } else if let Some(v) =
             record(&env).filter(|r| r.get("task_id").is_some() || r.get("status").is_some())
         {
-            Ok(json!([task_entry(v)]))
+            Ok(json!([task_entry(v)?]))
         } else {
             Ok(json!([]))
         }
     }
     pub(crate) async fn files_call(&self, method: &str, params: Value) -> Result<Value> {
+        let generation = self.session_generation();
         if self.cookie_header().is_empty() || self.call_status()["expired"] == true {
             return Err(Error::new("NEED_LOGIN", "请先登录夸克网盘"));
         }
         match method {
-            "fs.list"=>self.file_page(&params,false).await,
-            "fs.search"=>self.file_page(&params,true).await,
+            "fs.list"=>self.file_page(generation,&params,false).await,
+            "fs.search"=>self.file_page(generation,&params,true).await,
             "fs.info"=>{
                 let fid=required(if params.is_string(){&params}else{&params["fid"]},"文件 fid")?;
-                let env=self.get("/1/clouddrive/file/info",&[("fid",fid),("_fetch_full_path","1".into()),("need_profile_tags","1".into()),("kkkk","1".into())]).await?;
+                let env=self.get_in_session(generation,"/1/clouddrive/file/info",&[("fid",fid),("_fetch_full_path","1".into()),("need_profile_tags","1".into()),("kkkk","1".into())]).await?;
                 record(&env).map(file_item).ok_or_else(||Error::new("NOT_FOUND","未找到该文件，可能已被删除或移动"))
             }
             "fs.crumbs"=>{
                 let fid=if params.is_string(){text(&params)}else{text(&params["fid"])};
                 let root=json!([{"fid":"0","name":"全部文件"}]);if fid.is_empty()||fid=="0"{return Ok(root);}
-                match self.get("/1/clouddrive/file/info/path_list",&[("fid",fid)]).await {
+                match self.get_in_session(generation,"/1/clouddrive/file/info/path_list",&[("fid",fid)]).await {
                     Ok(env)=>{let out=list(&env).into_iter().flatten().filter_map(|v|{let fid=text(v.get("fid").unwrap_or(&v["id"]));if fid.is_empty(){None}else{Some(json!({"fid":fid,"name":text(v.get("file_name").unwrap_or(&v["name"]))}))}}).collect::<Vec<_>>();Ok(if out.is_empty(){root}else{json!(out)})}
                     Err(e) if e.code=="NEED_LOGIN"||e.code=="ABORTED"=>Err(e),Err(_)=>Ok(root)
                 }
             }
-            "fs.mkdir"=>Ok(accepted(&self.post("/1/clouddrive/file",json!({"pdir_fid":params["pdirFid"].as_str().filter(|s|!s.is_empty()).unwrap_or("0"),"file_name":required(&params["name"],"文件夹名称")?,"dir_path":"","dir_init_lock":false})).await?)),
-            "fs.rename"=>{required(&params["name"],"新名称")?;Ok(accepted(&self.post("/1/clouddrive/file/rename",json!({"fid":required(&params["fid"],"文件 fid")?,"file_name":params["name"]})).await?))},
-            "fs.move"=>Ok(accepted(&self.post("/1/clouddrive/file/move",json!({"action_type":1,"to_pdir_fid":required(&params["toFid"],"目标目录 fid")?,"filelist":ids(&params["fids"])? ,"exclude_fids":[]})).await?)),
-            "fs.copy"=>Ok(accepted(&self.post("/1/clouddrive/file/copy",json!({"action_type":2,"to_pdir_fid":required(&params["toFid"],"目标目录 fid")?,"filelist":ids(&params["fids"])? ,"copy_source":1})).await?)),
-            "fs.remove"=>Ok(accepted(&self.post("/1/clouddrive/file/delete",json!({"action_type":2,"filelist":ids(&params["fids"])? ,"exclude_fids":[]})).await?)),
-            "fs.taskStatus"=>self.task_status(&params).await,
+            "fs.mkdir"=>Ok(accepted(&self.post_in_session(generation,"/1/clouddrive/file",json!({"pdir_fid":params["pdirFid"].as_str().filter(|s|!s.is_empty()).unwrap_or("0"),"file_name":required(&params["name"],"文件夹名称")?,"dir_path":"","dir_init_lock":false})).await?)),
+            "fs.rename"=>{required(&params["name"],"新名称")?;Ok(accepted(&self.post_in_session(generation,"/1/clouddrive/file/rename",json!({"fid":required(&params["fid"],"文件 fid")?,"file_name":params["name"]})).await?))},
+            "fs.move"=>Ok(accepted(&self.post_in_session(generation,"/1/clouddrive/file/move",json!({"action_type":1,"to_pdir_fid":required(&params["toFid"],"目标目录 fid")?,"filelist":ids(&params["fids"])? ,"exclude_fids":[]})).await?)),
+            "fs.copy"=>Ok(accepted(&self.post_in_session(generation,"/1/clouddrive/file/copy",json!({"action_type":2,"to_pdir_fid":required(&params["toFid"],"目标目录 fid")?,"filelist":ids(&params["fids"])? ,"copy_source":1})).await?)),
+            "fs.remove"=>Ok(accepted(&self.post_in_session(generation,"/1/clouddrive/file/delete",json!({"action_type":2,"filelist":ids(&params["fids"])? ,"exclude_fids":[]})).await?)),
+            "fs.taskStatus"=>self.task_status(generation,&params).await,
             "fs.queryTask"=>{
                 let id=required(if params.is_string(){&params}else{&params["taskId"]},"任务 id")?;
-                let env=self.get("/1/clouddrive/task",&[("task_id",id)]).await?;
-                record(&env).map(task_entry).ok_or_else(||Error::new("NOT_FOUND","未找到该任务，可能已结束或被清理"))
+                let env=self.get_in_session(generation,"/1/clouddrive/task",&[("task_id",id)]).await?;
+                task_entry(record(&env).ok_or_else(||Error::new("NOT_FOUND","未找到该任务，可能已结束或被清理"))?)
             }
             "fs.waitTask"=>{
                 let mut pending=ids(&params["taskIds"])?;let start=std::time::Instant::now();
                 let timeout=number(&params["timeout"],180000).max(0) as u64;let interval=number(&params["interval"],1000).clamp(1,10000) as u64;
                 loop {
-                    let entries=self.task_status(&json!({"taskIds":pending,"opType":number(&params["opType"],1)})).await?;
+                    let entries=self.task_status(generation,&json!({"taskIds":pending,"opType":number(&params["opType"],1)})).await?;
                     pending.retain(|id|!entries.as_array().unwrap().iter().any(|v|v["taskId"]==id.as_str()&&v["done"]==true));
                     if pending.is_empty(){return Ok(json!({"done":true,"entries":entries,"pending":[],"elapsed":start.elapsed().as_millis() as u64}));}
                     if start.elapsed().as_millis()>=timeout as u128{return Err(Error::new("TASK_FAILED","操作超时，任务可能仍在后台执行，请稍后刷新查看"));}
@@ -263,8 +290,8 @@ impl Core {
             }
             "fs.listAll"=>{
                 let size=number(&params["pageSize"],100).clamp(1,1000);let max_pages=number(&params["maxPages"],500).clamp(1,10000);
-                let mut out=Vec::new();let mut page_params=params.clone();let mut total=-1;let mut truncated=false;
-                for page in 1..=max_pages {page_params["page"]=json!(page);page_params["size"]=json!(size);let p=self.file_page(&page_params,false).await?;let list=p["list"].as_array().unwrap();total=number(&p["total"],-1);out.extend(list.iter().cloned());if list.is_empty()||p["hasMore"]!=true{break;}if page==max_pages{truncated=true;}}
+                let mut out=Vec::new();let mut page_params=if params.is_object(){params.clone()}else{json!({})};let mut total=-1;let mut truncated=false;
+                for page in 1..=max_pages {page_params["page"]=json!(page);page_params["size"]=json!(size);let p=self.file_page(generation,&page_params,false).await?;let list=p["list"].as_array().unwrap();total=number(&p["total"],-1);out.extend(list.iter().cloned());if list.is_empty()||p["hasMore"]!=true{break;}if page==max_pages{truncated=true;}}
                 Ok(json!({"list":out,"total":if total>=0{total}else{out.len() as i64},"page":1,"size":size,"hasMore":truncated,"truncated":truncated}))
             }
             _=>Err(Error::new("INVALID_ARG","未知文件操作"))
@@ -303,16 +330,34 @@ mod tests {
     #[test]
     fn unknown_numeric_task_status_never_means_success() {
         assert_eq!(
-            task_entry(&json!({"task_id":"t","status":2}))["done"],
+            task_entry(&json!({"task_id":"t","status":2})).unwrap()["done"],
             false
         );
         assert_eq!(
-            task_entry(&json!({"task_id":"t","status":"finish"}))["done"],
+            task_entry(&json!({"task_id":"t","status":"finish"})).unwrap()["done"],
             true
         );
         assert_eq!(
             accepted(&json!({"data":{"task_id":"t"}})),
             json!({"taskId":"t","done":false})
+        );
+    }
+    #[test]
+    fn explicit_task_failure_wins_over_finish_and_success_flags() {
+        for raw in [
+            json!({"task_id":"t","finish":true,"success":false}),
+            json!({"task_id":"t","done":true,"status":"failed"}),
+            json!({"task_id":"t","success":true,"failed":true}),
+        ] {
+            assert_eq!(task_entry(&raw).unwrap_err().code, "TASK_FAILED");
+        }
+        assert_eq!(
+            task_entry(&json!({"task_id":"t","status":2,"success":false})).unwrap()["done"],
+            false
+        );
+        assert_eq!(
+            task_entry(&json!({"task_id":"t","finish":true,"success":true})).unwrap()["done"],
+            true
         );
     }
 }

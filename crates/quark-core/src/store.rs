@@ -11,6 +11,7 @@ use std::{
     path::{Path, PathBuf},
 };
 const MAGIC: &[u8; 4] = b"QCK2";
+const MAX_SESSION_BYTES: u64 = 8 * 1024 * 1024;
 pub(crate) struct LocalStore {
     dir: PathBuf,
 }
@@ -22,7 +23,20 @@ impl LocalStore {
         let store = Self {
             dir: dir.to_owned(),
         };
+        if let Ok(meta) = fs::symlink_metadata(dir) {
+            if !meta.file_type().is_dir() {
+                return Err(Error::new("STORAGE", "本地资料目录必须为普通目录"));
+            }
+        }
         let file = dir.join("session.bin");
+        match fs::symlink_metadata(&file) {
+            Ok(meta) if !meta.file_type().is_file() || meta.len() > MAX_SESSION_BYTES => {
+                return Err(Error::new("STORAGE", "本地登录资料文件无效，原文件已保留"))
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((store, json!({}))),
+            Err(e) => return Err(io_error(e)),
+        }
         let bytes = match fs::read(file) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((store, json!({}))),
@@ -112,6 +126,9 @@ impl LocalStore {
         rand::thread_rng().fill_bytes(&mut nonce);
         let plain = serde_json::to_vec(&json!({"v":2,"data":data}))
             .map_err(|_| Error::new("STORAGE", "本地资料无法序列化"))?;
+        if plain.len() as u64 > MAX_SESSION_BYTES - 32 {
+            return Err(Error::new("STORAGE", "本地登录资料过大，原文件已保留"));
+        }
         let encrypted = cipher
             .encrypt(
                 Nonce::from_slice(&nonce),
@@ -138,6 +155,9 @@ impl LocalStore {
     }
 }
 fn private_dir(dir: &Path) -> Result<()> {
+    if fs::symlink_metadata(dir).is_ok_and(|meta| !meta.file_type().is_dir()) {
+        return Err(Error::new("STORAGE", "本地资料目录必须为普通目录"));
+    }
     fs::create_dir_all(dir).map_err(io_error)?;
     #[cfg(unix)]
     {
@@ -169,4 +189,82 @@ fn sync_dir(path: &Path) -> Result<()> {
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encryption_is_randomized_and_no_credentials_are_in_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _) = LocalStore::open(dir.path()).unwrap();
+        let doc = json!({"cookies":[{"name":"test_only", "value":"synthetic-not-a-real-secret"}]});
+        store.write(&doc).unwrap();
+        let first = fs::read(dir.path().join("session.bin")).unwrap();
+        store.write(&doc).unwrap();
+        let second = fs::read(dir.path().join("session.bin")).unwrap();
+        assert_ne!(first, second);
+        assert!(!second
+            .windows(b"synthetic-not-a-real-secret".len())
+            .any(|w| w == b"synthetic-not-a-real-secret"));
+        assert_eq!(LocalStore::open(dir.path()).unwrap().1, doc);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for name in ["session.key", "session.bin"] {
+                assert_eq!(
+                    fs::metadata(dir.path().join(name))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+            assert_eq!(
+                fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_unknown_and_oversized_sessions_are_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("session.bin");
+        for raw in [b"QCK1legacy".as_slice(), b"unknown-format".as_slice()] {
+            fs::write(&file, raw).unwrap();
+            assert!(LocalStore::open(dir.path()).is_err());
+            assert_eq!(fs::read(&file).unwrap(), raw);
+        }
+        let large = fs::File::create(&file).unwrap();
+        large.set_len(MAX_SESSION_BYTES + 1).unwrap();
+        assert!(LocalStore::open(dir.path()).is_err());
+        assert_eq!(fs::metadata(file).unwrap().len(), MAX_SESSION_BYTES + 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_profile_session_and_key_are_rejected_without_touching_target() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = root.path().join("linked-profile");
+        symlink(&target, &link).unwrap();
+        assert!(LocalStore::open(&link).is_err());
+        let (store, _) = LocalStore::open(&target).unwrap();
+        let key_target = root.path().join("private-key");
+        fs::write(&key_target, [7u8; 32]).unwrap();
+        symlink(&key_target, target.join("session.key")).unwrap();
+        assert!(store.write(&json!({})).is_err());
+        assert_eq!(fs::read(&key_target).unwrap(), [7u8; 32]);
+        fs::remove_file(target.join("session.key")).unwrap();
+        let session_target = root.path().join("private-session");
+        fs::write(&session_target, b"untouched").unwrap();
+        symlink(&session_target, target.join("session.bin")).unwrap();
+        assert!(LocalStore::open(&target).is_err());
+        assert_eq!(fs::read(session_target).unwrap(), b"untouched");
+    }
 }

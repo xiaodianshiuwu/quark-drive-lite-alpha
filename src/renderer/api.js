@@ -194,6 +194,8 @@
     normalizeError: normalizeError,
     has: hasMethod,
 
+    app: { quit: expose('app', 'quit') },
+
     auth: {
       status: expose('auth', 'status'),
       verify: expose('auth', 'verify'),
