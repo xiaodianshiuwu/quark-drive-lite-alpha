@@ -1,0 +1,21 @@
+[package]
+name = "quark-core"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+aes-gcm = "0.10"
+cookie = "0.18"
+dirs = "6"
+html-escape = "0.2"
+rand = "0.8"
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls-native-roots", "json", "stream", "socks", "system-proxy"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["time"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

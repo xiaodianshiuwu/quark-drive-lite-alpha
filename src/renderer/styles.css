@@ -281,6 +281,8 @@ button, input, select { font-family: inherit; font-size: inherit; color: inherit
   border-radius: var(--radius); outline: none;
 }
 .list { min-height: 100%; }
+.list-spacer { height: 0; pointer-events: none; overflow-anchor: none; }
+.listwrap { overflow-anchor: none; }
 
 .row {
   height: var(--row-h); border-bottom: 1px solid var(--border);
@@ -617,3 +619,6 @@ select.input { padding-right: 6px; }
 @media (prefers-reduced-motion: reduce) {
   * { animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }
+
+.btn-quit { width: calc(100% - 20px); margin: 8px 10px 12px; justify-content: flex-start; color: var(--text-2); }
+.btn-quit:hover { color: var(--text); background: var(--surface-2); }

@@ -1,39 +1,20 @@
 {
   "name": "quark-mini",
-  "version": "0.2.0-rc.1",
+  "version": "0.3.0-alpha.1",
   "private": true,
   "description": "夸克网盘极简桌面客户端 — 仅保留文件浏览、搜索、新建、移动、复制、重命名、批量删除、上传、下载与传输任务管理",
-  "main": "src/main/main.js",
   "engines": {
     "node": ">=24.18.0"
   },
-  "packageManager": "pnpm@11.25.0",
   "scripts": {
-    "start": "node scripts/start.js",
-    "test": "node --test test/*.test.js",
-    "verify": "node verify/integration.js",
-    "verify:smoke": "node verify/smoke-electron.js",
-    "verify:encryption": "node verify/encryption-roundtrip.js",
-    "verify:all": "npm test && node verify/integration.js && node verify/smoke-electron.js",
-    "check": "node scripts/check.js",
-    "e2e": "node verify/e2e-real.js",
-    "verify:p0-real": "node verify/p0-real.js",
-    "migrate-session": "node scripts/migrate-session.js",
-    "login": "node tools/login-assisted.js",
-    "import-session": "node tools/import-browser-session.js",
-    "native": "node tools/quark-mini-native.js",
-    "stability": "node tools/stability-test.js --full",
-    "pack": "npm run pack:win && node tools/make-portable.js",
-    "pack:win": "electron-builder --win --x64 --dir --publish never --config builder.config.json",
-    "pack:linux": "electron-builder --linux --x64 --dir --publish never --config builder.config.json",
-    "pack:mac": "node scripts/pack-mac.js",
-    "pack:asar": "asar pack .build-staging dist/win-unpacked/resources/app.asar",
-    "release:archive": "node scripts/release-archive.js"
+    "start": "node scripts/tauri.js dev",
+    "build": "node scripts/tauri.js build",
+    "check": "cargo check --workspace",
+    "test": "node --test test/tauri*.test.js",
+    "test:rust": "cargo test --workspace",
+    "test:legacy": "node --test test/*.test.js"
   },
   "devDependencies": {
-    "@electron/asar": "^4.3.1",
-    "electron": "44.7.2",
-    "electron-builder": "^26.15.3",
-    "playwright-core": "^1.64.0"
+    "@tauri-apps/cli": "2.12.3"
   }
 }

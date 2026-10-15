@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Only the bundled main interface can receive app events. Remote login content has no capabilities.",
+  "windows": ["main"],
+  "permissions": ["core:event:default", "core:window:allow-start-dragging"]
+}

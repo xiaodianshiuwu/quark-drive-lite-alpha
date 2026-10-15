@@ -1,0 +1,3 @@
+[build]
+# `npm start` and `npm run build` choose a per-project cache outside FileProvider.
+# Direct Cargo commands may use the normal ignored target directory.

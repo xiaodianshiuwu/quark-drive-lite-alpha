@@ -14,8 +14,7 @@
    * ================================================================== */
 
   var PAGE_SIZE = 100;
-  var MAX_ROWS = 4000;          // DOM 行数硬上限，避免数千条时卡顿
-  var CHUNK = 60;               // requestAnimationFrame 分批插入的行数
+  var VIRTUAL_OVERSCAN = 8;      // 只挂载可见行及前后缓冲行
   var ROOT_FID = '0';
   var TASK_POLL_MS = 600;
   var TASK_POLL_MAX = 40;       // 最多轮询 40 次（约 24s）
@@ -62,6 +61,9 @@
   var unsubs = [];
   var toastSeq = 0;
   var listSeq = 0;
+  var listFrame = null;
+  var topSpacer = null;
+  var bottomSpacer = null;
 
   function $(id) { return document.getElementById(id); }
 
@@ -759,7 +761,6 @@
 
   function resetList() {
     listSeq += 1;
-    state.truncated = false;
     state.selected.clear();
     state.lastIndex = -1;
     rowMap.forEach(function (n) { if (n.parentNode) n.parentNode.removeChild(n); });
@@ -772,6 +773,10 @@
     state.loading = false;
     state.loadedOnce = false;
     el.list.textContent = '';
+    topSpacer = null;
+    bottomSpacer = null;
+    el.listwrap.scrollTop = 0;
+    clearEmpty();
     renderListFoot();
     updateSelectAll();
   }
@@ -788,11 +793,6 @@
     var o = opts || {};
     if (state.loading) return;
     if (!o.reset && !state.hasMore) return;
-    if (state.items.length >= MAX_ROWS) {
-      state.hasMore = false;
-      renderListFoot();
-      return;
-    }
     var seq = listSeq;
     state.loading = true;
     renderListFoot();
@@ -829,10 +829,6 @@
       if (!state.hasMore && list.length >= PAGE_SIZE && (state.total < 0 || state.items.length < state.total)) {
         state.hasMore = true;
       }
-      if (state.items.length >= MAX_ROWS) {
-        state.hasMore = false;
-        state.truncated = true;
-      }
       state.loadedOnce = true;
       await renderRows(seq);
     } catch (err) {
@@ -852,7 +848,7 @@
   /** 首屏不足一屏且仍有下一页时继续拉取，保证滚动容器可滚动。 */
   function maybeAutoFill() {
     if (!state.hasMore || state.loading) return;
-    if (el.listwrap.scrollHeight <= el.listwrap.clientHeight + 8 && state.items.length < MAX_ROWS) {
+    if (el.listwrap.scrollHeight <= el.listwrap.clientHeight + 8) {
       loadPage({});
     }
   }
@@ -918,60 +914,55 @@
     if (row.classList.contains('selected') !== sel) row.classList.toggle('selected', sel);
   }
 
-  /** 最小化 DOM diff：按 fid 复用行节点，仅对新增节点做分批插入。 */
+  /** Visible rows only: data and selection survive when their DOM nodes leave the viewport. */
   async function renderRows(seq) {
-    var items = state.items;
-    var ref = el.list.firstChild;
-    var pending = [];
-
-    for (var i = 0; i < items.length; i++) {
-      var item = items[i];
+    if (seq !== listSeq) return;
+    if (!topSpacer) {
+      topSpacer = h('div', 'list-spacer');
+      bottomSpacer = h('div', 'list-spacer');
+      topSpacer.setAttribute('aria-hidden', 'true');
+      bottomSpacer.setAttribute('aria-hidden', 'true');
+      el.list.appendChild(topSpacer);
+      el.list.appendChild(bottomSpacer);
+    }
+    var rowHeight = parseFloat(getComputedStyle(el.list).getPropertyValue('--row-h')) || 46;
+    var range = window.QKVirtualList.range(state.items.length, el.listwrap.scrollTop,
+      el.listwrap.clientHeight || 600, rowHeight, VIRTUAL_OVERSCAN);
+    var visible = new Set();
+    for (var i = range.start; i < range.end; i++) visible.add(String(state.items[i].fid));
+    rowMap.forEach(function (row, fid) {
+      if (!visible.has(fid)) {
+        if (row.parentNode) row.parentNode.removeChild(row);
+        rowMap.delete(fid);
+      }
+    });
+    topSpacer.style.height = range.before + 'px';
+    bottomSpacer.style.height = range.after + 'px';
+    var ref = topSpacer.nextSibling;
+    for (var j = range.start; j < range.end; j++) {
+      var item = state.items[j];
       var key = String(item.fid);
       var row = rowMap.get(key);
       if (!row) {
         row = createRow(item);
         rowMap.set(key, row);
-        pending.push(row);
-      } else {
-        updateRow(row, item);
       }
-      if (row === ref) {
-        ref = ref.nextSibling;
-      } else if (pending.indexOf(row) < 0) {
-        el.list.insertBefore(row, ref);
-      }
+      updateRow(row, item);
+      row.setAttribute('aria-posinset', String(j + 1));
+      row.setAttribute('aria-setsize', String(state.total >= 0 ? state.total : state.items.length));
+      if (row === ref) ref = ref.nextSibling;
+      else el.list.insertBefore(row, ref || bottomSpacer);
     }
-    // 移除已不存在的行
-    var node = ref;
-    while (node) {
-      var nxt = node.nextSibling;
-      if (node.nodeType === 1) {
-        var f = node.dataset ? node.dataset.fid : null;
-        if (!f || !state.itemMap[f]) { rowMap.delete(f); node.parentNode.removeChild(node); }
-      }
-      node = nxt;
-    }
-    // 分批插入新增行，避免一次插入数千节点造成掉帧
-    if (pending.length) await insertChunked(pending, seq);
-    if (seq !== listSeq) return;
-
     updateSelectAll();
     if (!state.items.length) renderEmpty(state.mode === 'search' ? '没有找到匹配的文件' : '这个文件夹是空的', false);
     else clearEmpty();
   }
 
-  function insertChunked(nodes, seq) {
-    return new Promise(function (resolve) {
-      var i = 0;
-      (function step() {
-        if (seq !== listSeq) { resolve(); return; }
-        var end = Math.min(nodes.length, i + CHUNK);
-        var frag = document.createDocumentFragment();
-        for (; i < end; i++) frag.appendChild(nodes[i]);
-        el.list.appendChild(frag);
-        if (i < nodes.length) requestAnimationFrame(step);
-        else resolve();
-      })();
+  function scheduleRows() {
+    if (listFrame !== null) return;
+    listFrame = requestAnimationFrame(function () {
+      listFrame = null;
+      if (state.view === 'files') renderRows(listSeq);
     });
   }
 
@@ -1002,10 +993,6 @@
       l.appendChild(h('span', 'spinner'));
       l.appendChild(h('span', null, '加载中…'));
       foot.appendChild(l);
-      return;
-    }
-    if (state.truncated) {
-      foot.appendChild(h('div', 'foot-line muted', '为保证流畅，最多显示 ' + MAX_ROWS + ' 项，请使用搜索定位其它文件。'));
       return;
     }
     if (!state.loadedOnce) return;
@@ -1085,8 +1072,11 @@
       var b = Math.max(state.lastIndex, index);
       for (var i = a; i <= b; i++) {
         var it = state.items[i];
-        if (it) setSelected(it.fid, on);
+        if (it) {
+          if (on) state.selected.add(String(it.fid)); else state.selected.delete(String(it.fid));
+        }
       }
+      renderRows(listSeq);
       state.lastIndex = index;
       return;
     }
@@ -1658,6 +1648,7 @@
     el.viewTransfers.hidden = view !== 'transfers';
     el.viewSettings.hidden = view !== 'settings';
     setTopbarForView();
+    if (view === 'files') scheduleRows();
     if (view === 'transfers') refreshTransfers();
     if (view === 'settings') renderSettings();
   }
@@ -1702,6 +1693,7 @@
       e.preventDefault();
       depth = 0;
       el.dropmask.hidden = true;
+      if (API.has('dialog', 'onFilesDropped')) return; // Tauri delivers native paths separately.
       var files = Array.prototype.slice.call(e.dataTransfer.files || []);
       if (!files.length) return;
       if (state.view !== 'files') {
@@ -1777,11 +1769,18 @@
     // 列表滚动：无限加载
     el.listwrap.addEventListener('scroll', function () {
       if (state.view !== 'files') return;
+      scheduleRows();
       if (state.loading || !state.hasMore) return;
       if (el.listwrap.scrollTop + el.listwrap.clientHeight >= el.listwrap.scrollHeight - 240) {
         loadPage({});
       }
     }, { passive: true });
+    window.addEventListener('resize', scheduleRows);
+    if (typeof ResizeObserver === 'function') {
+      var listResizeObserver = new ResizeObserver(scheduleRows);
+      listResizeObserver.observe(el.listwrap);
+      unsubs.push(function () { listResizeObserver.disconnect(); });
+    }
 
     // 列表交互（事件委托）
     el.list.addEventListener('click', function (e) {
@@ -2002,6 +2001,7 @@
     el.nav = $('nav');
     el.transferBadge = $('transfer-badge');
     el.sidebarFoot = $('sidebar-foot');
+    el.btnQuit = $('btn-quit');
     el.crumbs = $('crumbs');
     el.searchBox = $('search-box');
     el.searchInput = $('search-input');
@@ -2065,8 +2065,18 @@
 
   async function boot() {
     cacheEls();
+    if (el.btnQuit) el.btnQuit.addEventListener('click', function () { if (window.qk && window.qk.app) window.qk.app.quit(); });
     bindEvents();
     setupDragDrop();
+    unsubs.push(API.dialog.onFilesDropped(function (paths) {
+      el.dropmask.hidden = true;
+      if (state.view !== 'files') {
+        toast('warn', '请先切换到「全部文件」再拖拽上传');
+        setView('files');
+        return;
+      }
+      doUploadPaths(paths).catch(function (err) { reportError(err, '拖拽上传失败'); });
+    }));
 
     var info = API.bridgeInfo();
     el.envHint.textContent = info.text;

@@ -1,0 +1,8 @@
+[workspace]
+members = ["crates/quark-core", "crates/quark-transfer", "src-tauri"]
+resolver = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

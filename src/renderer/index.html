@@ -5,10 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <!--
   内容安全策略：默认禁止一切外部资源。
-  connect-src 'none' 表示渲染进程不会发起任何网络请求（全部网络访问由主进程承担）。
+  connect-src 仅允许 Tauri 本机 IPC；全部夸克与传输网络访问由 Rust 核心承担。
   script-src / style-src 允许 'self' 与 file:，以便在 Electron(file://) 与本地浏览器中均可直接打开本页调试。
 -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' file:; style-src 'self' file: 'unsafe-inline'; img-src 'self' file: data:; font-src 'self' file:; connect-src 'none'; media-src 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' file:; style-src 'self' file: 'unsafe-inline'; img-src 'self' file: data:; font-src 'self' file:; connect-src ipc: http://ipc.localhost https://ipc.localhost; media-src 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'none'">
 <meta name="color-scheme" content="light dark">
 <title>夸克网盘 · 极简版</title>
 <link rel="stylesheet" href="styles.css">
@@ -46,6 +46,7 @@
     </nav>
 
     <div class="sidebar-foot" id="sidebar-foot"></div>
+    <button type="button" class="btn btn-ghost btn-quit" id="btn-quit" title="退出应用并保存任务进度">退出客户端</button>
   </aside>
 
   <!-- ======================= 右侧主区 ======================= -->
@@ -167,7 +168,7 @@
         <div class="setrow">
           <div class="setlabel">
             <div class="setname">上传分片预读并发</div>
-            <div class="sethint">大文件上传时同时传输的分片数，越高越快，范围 1–8。</div>
+            <div class="sethint">同时预读的分片数，范围 1–8；上传请求按服务端要求依次发送。</div>
           </div>
           <div class="setcontrol">
             <input type="number" id="set-up-part" class="input input-num" min="1" max="8" step="1">
@@ -303,7 +304,9 @@
   Electron 的沙箱渲染进程同样以 file: 载入本页。
   因此采用经典脚本 + 显式命名空间（window.QKAPI / window.QKUI），不依赖任何打包器，功能等价且更稳健。
 -->
+<script src="tauri-bridge.js" defer></script>
 <script src="api.js" defer></script>
+<script src="virtual-list.js" defer></script>
 <script src="app.js" defer></script>
 </body>
 </html>

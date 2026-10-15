@@ -244,6 +244,7 @@
       confirm: expose('dialog', 'confirm'),
       openPath: expose('dialog', 'openPath'),
       showInFolder: expose('dialog', 'showInFolder'),
+      onFilesDropped: function (cb) { return subscribe([['dialog', 'onFilesDropped']], cb); },
       /**
        * 拖拽上传取真实路径（封装 webUtils.getPathForFile）。
        * 桥接层未暴露或返回空时返回 ''，由 UI 提示改用上传按钮。

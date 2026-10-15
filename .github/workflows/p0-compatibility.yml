@@ -1,96 +1,33 @@
-name: P0 三平台验证
+name: Tauri migration checks
 on:
   pull_request:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: p0-${{ github.event.pull_request.number || github.ref }}
+  group: tauri-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 jobs:
   compatibility:
-    name: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-2022, macos-15, macos-15-intel]
+        os: [ubuntu-24.04, windows-2022, macos-15, macos-15-intel]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
-    env:
-      CI: 'true'
-      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
-          package-manager-cache: false
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 11.25.0
-          run_install: false
-      - name: 冻结安装并校验 Electron 官方运行时
-        run: |
-          pnpm install --frozen-lockfile --ignore-scripts
-          node node_modules/electron/install.js
-      - name: Linux 图形与密钥环依赖
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux native dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb gnome-keyring libsecret-1-0 libgtk-3-0 libasound2 libgbm1
-      - name: 静态检查与离线链路测试
-        run: |
-          npm run check
-          npm test
-          npm run verify
-      - name: 准备旧版加密兼容样本运行时
-        run: node scripts/prepare-legacy-runtime.js
-      - name: macOS 旧格式迁移的独立测试密钥环
-        if: runner.os == 'macOS'
-        run: bash scripts/ci-macos-keychain.sh
-      - name: Linux 源码冒烟与加密回读
-        if: runner.os == 'Linux'
-        run: bash scripts/ci-linux-gui.sh bash -c 'npm run verify:smoke && npm run verify:encryption'
-      - name: Windows/macOS 源码冒烟与加密回读
-        if: runner.os != 'Linux'
-        run: |
-          npm run verify:smoke
-          npm run verify:encryption
-      - name: Linux 旧版加密迁移
-        if: runner.os == 'Linux'
-        run: bash scripts/ci-linux-gui.sh node verify/encryption-roundtrip.js --legacy
-      - name: Windows/macOS 旧版加密迁移
-        if: runner.os != 'Linux'
-        run: node verify/encryption-roundtrip.js --legacy
-      - name: Windows 目录构建
-        if: runner.os == 'Windows'
-        run: npm run pack
-      - name: Linux 目录构建
-        if: runner.os == 'Linux'
-        run: npm run pack:linux
-      - name: macOS 目录构建
-        if: runner.os == 'macOS'
-        env:
-          # identity 固定为 '-'；仅运行本地 ad-hoc 签名，无证书或发布凭据。
-          CSC_FOR_PULL_REQUEST: 'true'
-        run: npm run pack:mac
-      - name: Linux 构建产物冒烟
-        if: runner.os == 'Linux'
-        run: bash scripts/ci-linux-gui.sh node verify/packaged-smoke.js
-      - name: Windows/macOS 构建产物冒烟
-        if: runner.os != 'Linux'
-        run: node verify/packaged-smoke.js
-      - name: Windows 便携产物冒烟
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $env:QCK_PACKAGED_EXECUTABLE = Join-Path $PWD 'dist/夸克网盘极简版/夸克网盘极简版.exe'
-          node verify/packaged-smoke.js
-      - name: 归档已验证的预发布产物
-        run: npm run release:archive
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-${{ matrix.os }}
-          path: .work/release/*
-          if-no-files-found: error
-          retention-days: 14
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev
+      - run: npm ci --ignore-scripts
+      - run: cargo test --workspace --locked
+      - run: npm test
+      - name: Compile native app (no publication)
+        run: npx tauri build --no-bundle
