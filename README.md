@@ -1,5 +1,8 @@
 # 夸克网盘极简版 · Tauri 迁移开发版
 
+> [!WARNING]
+> **该项目为 beta 版本，持续开发中：功能均尚未完善，可能遇到无法正常使用的各类问题，敬请注意。**
+
 原有界面迁移到 Tauri 2，系统 WebView 承载本地界面，Rust 核心负责网络、会话、文件操作和传输。应用运行不需要 Node.js 或 Electron；Node.js 仅用于开发工具。
 
 本分支尚未合并、发布。当前进度、验证边界和恢复入口见 [MIGRATION_STATUS.md](MIGRATION_STATUS.md)。原版 Electron 实现保留在 `src/main` 供协议对照，不参与 Tauri 构建；历史使用说明见基线提交。
